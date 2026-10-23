@@ -1,0 +1,15 @@
+name = "grokkius-fleet"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+workers_dev = true
+
+# Free plan allows 5 cron triggers per account; one is enough here.
+[triggers]
+crons = ["23 */3 * * *"]
+
+# Optional, create with: wrangler kv namespace create FLEET_KV  (then paste the id)
+# [[kv_namespaces]]
+# binding = "FLEET_KV"
+# id = "<kv-namespace-id>"
+
+# Secrets (never commit): wrangler secret put FLEET_TOKEN ; wrangler secret put SUPERTEAM_KEY

@@ -1,0 +1,12 @@
+{"targets":[
+ {"name":"surge-home","url":"https://sirgrokkius.surge.sh/","terms":["Sir Grokkius"]},
+ {"name":"surge-hire","url":"https://sirgrokkius.surge.sh/hire.html","terms":["Sir Grokkius"]},
+ {"name":"surge-portfolio","url":"https://sirgrokkius.surge.sh/portfolio.html","terms":["Sir Grokkius"]},
+ {"name":"surge-reliability","url":"https://sirgrokkius.surge.sh/reliability.html","terms":["Sir Grokkius"]},
+ {"name":"surge-blog","url":"https://sirgrokkius.surge.sh/blog/","terms":["Sir Grokkius"]},
+ {"name":"surge-samples","url":"https://sirgrokkius.surge.sh/samples/","terms":[]},
+ {"name":"surge-videos","url":"https://sirgrokkius.surge.sh/videos/","terms":[]},
+ {"name":"hf-static","url":"https://sirgrokkius-sir-grokkius.static.hf.space/index.html","terms":["Sir Grokkius"]},
+ {"name":"neocities","url":"https://sirgrokkius.neocities.org/","terms":["Sir Grokkius"]},
+ {"name":"nsite","url":"https://npub1s2aznz20l7vlycxlg3m6xfpz8hwz9xspq52kwqrk4a3v42r28uzqlad53d.nsite.lol/","terms":["Sir Grokkius"]}
+]}

@@ -1,0 +1,37 @@
+name: linkcheck
+# Scheduled smoke test of the project's own published sites (CI-style use of Actions).
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # every 6h, off the top of the hour
+  workflow_dispatch:
+    inputs:
+      external:
+        description: "also check off-site links"
+        type: boolean
+        default: true
+permissions:
+  contents: write
+concurrency:
+  group: linkcheck
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run linkcheck
+        run: |
+          EXT=""
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.external }}" = "true" ]; then EXT="--external"; fi
+          python scripts/linkcheck.py --targets targets.json --out results/linkcheck.json --prev results/linkcheck.json $EXT
+      - name: Commit compact result
+        run: |
+          git config user.name "grokkius-fleet-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results/linkcheck.json
+          git diff --cached --quiet || git commit -m "results: linkcheck [skip ci]"
+          git push
