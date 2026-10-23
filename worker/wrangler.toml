@@ -1,15 +1,14 @@
-name = "grokkius-fleet"
+# Deploy: npx wrangler deploy  (needs a Cloudflare API token with Workers Scripts:Edit [+ Workers KV Storage:Edit])
+# Secrets: npx wrangler secret put FLEET_TOKEN ; npx wrangler secret put SUPERTEAM_KEY
+name = "grokkius-fleet-watch"
 main = "worker.js"
 compatibility_date = "2026-10-01"
 workers_dev = true
 
-# Free plan allows 5 cron triggers per account; one is enough here.
 [triggers]
-crons = ["23 */3 * * *"]
+crons = ["37 */2 * * *"]   # every 2 h at :37 (1 of 5 free cron triggers)
 
-# Optional, create with: wrangler kv namespace create FLEET_KV  (then paste the id)
+# Uncomment after: npx wrangler kv namespace create FLEET_KV
 # [[kv_namespaces]]
 # binding = "FLEET_KV"
-# id = "<kv-namespace-id>"
-
-# Secrets (never commit): wrangler secret put FLEET_TOKEN ; wrangler secret put SUPERTEAM_KEY
+# id = "<namespace id>"

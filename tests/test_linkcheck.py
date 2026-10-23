@@ -1,65 +1,73 @@
-import json, subprocess, sys, tempfile, threading, unittest
+"""Offline tests for scripts/linkcheck.py using a local http.server."""
+import json, os, sys, tempfile, threading, unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+import linkcheck  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent
 PAGES = {
-    "/": b'<html>Sir Grokkius <a href="/a">a</a> <a href="/gone">g</a> <a href="#x">x</a></html>',
-    "/a": b"<html>fine</html>",
-    "/plain": b"<html>no name here</html>",
+    "/a": (200, '<a href="/b">b</a> <a href="/gone">x</a> <a href="/nohead">n</a> <a href="mailto:x@y">m</a> hello world'),
+    "/b": (200, "plain"),
+    "/gone": (404, ""),
+    "/nohead": (200, "ok"),
+    "/forbidden": (403, ""),
 }
+
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
-    def _send(self, body=True):
-        if self.path in PAGES:
-            self.send_response(200); self.end_headers()
-            if body: self.wfile.write(PAGES[self.path])
-        elif self.path == "/forbidden":
-            self.send_response(403); self.end_headers()
-        else:
-            self.send_response(404); self.end_headers()
-    def do_GET(self): self._send()
-    def do_HEAD(self): self._send(False)
+    def _send(self, head):
+        code, body = PAGES.get(self.path, (404, ""))
+        if head and self.path == "/nohead":
+            code = 405
+        self.send_response(code); self.send_header("Content-Type", "text/html"); self.end_headers()
+        if not head: self.wfile.write(body.encode())
+    def do_GET(self): self._send(False)
+    def do_HEAD(self): self._send(True)
+
 
 class T(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
         threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
-        cls.base = f"http://127.0.0.1:{cls.srv.server_address[1]}"
+        cls.base = f"http://127.0.0.1:{cls.srv.server_port}"
+        linkcheck.RETRY_DELAY = 0
+
     @classmethod
     def tearDownClass(cls): cls.srv.shutdown()
 
-    def run_lc(self, targets, extra=()):
-        d = Path(tempfile.mkdtemp())
-        (d / "t.json").write_text(json.dumps(targets))
-        p = subprocess.run([sys.executable, str(ROOT / "scripts/linkcheck.py"), "--targets", str(d / "t.json"),
-                            "--out", str(d / "out/r.json"), "--timeout", "5", *extra], capture_output=True, text=True)
-        return p, (json.loads((d / "out/r.json").read_text()) if p.returncode == 0 else None)
+    def run_lc(self, targets, prev=None):
+        d = tempfile.mkdtemp()
+        tf, of = os.path.join(d, "t.json"), os.path.join(d, "o.json")
+        json.dump({"targets": targets}, open(tf, "w"))
+        args = ["--targets", tf, "--out", of, "--timeout", "5"] + (["--prev", prev] if prev else [])
+        self.assertEqual(linkcheck.main(args), 0)
+        return json.load(open(of)), of
 
-    def test_statuses(self):
+    def test_statuses_and_links(self):
         b = self.base
-        p, r = self.run_lc({"targets": [
-            {"name": "home", "url": b + "/", "terms": ["sir grokkius"]},
-            {"name": "plain", "url": b + "/plain", "terms": ["Sir Grokkius"]},
+        out, of = self.run_lc([
+            {"name": "a", "url": b + "/a", "terms": ["hello"]},
+            {"name": "a-miss", "url": b + "/a", "terms": ["absent"]},
+            {"name": "gone", "url": b + "/gone"},
             {"name": "forb", "url": b + "/forbidden"},
-            {"name": "dead", "url": b + "/nope"}]})
-        self.assertEqual(p.returncode, 0, p.stderr)
-        by = {x["name"]: x for x in r["results"]}
-        self.assertEqual([x["name"] for x in r["results"]], sorted(by))
-        self.assertEqual(by["home"]["status"], "ok")
-        self.assertEqual(by["home"]["broken_links"], [{"url": b + "/gone", "code": 404}])
-        self.assertEqual(by["plain"]["status"], "missing_terms")
-        self.assertEqual(by["plain"]["missing"], ["Sir Grokkius"])
-        self.assertEqual(by["forb"]["status"], "blocked")
-        self.assertEqual(by["dead"]["status"], "dead")
-        self.assertEqual(r["summary"]["total"], 4)
-        self.assertEqual(r["summary"]["broken_links"], 1)
+        ])
+        st = {r["name"]: r["status"] for r in out["results"]}
+        self.assertEqual(st, {"a": "ok", "a-miss": "missing_terms", "gone": "dead", "forb": "blocked"})
+        self.assertEqual([x["url"] for x in out["broken"]], [b + "/gone"])  # /nohead falls back to GET
+        self.assertEqual(out["summary"]["links_checked"], 2)  # /b + /nohead probed; /gone reused; mailto ignored
+        self.assertFalse(any(r["changed"] for r in out["results"]))
+        PAGES["/a"] = (200, PAGES["/a"][1] + " v2")
+        out2, _ = self.run_lc([{"name": "a", "url": b + "/a", "terms": []}], prev=of)
+        self.assertTrue(out2["results"][0]["changed"])
 
-    def test_invalid_targets(self):
-        p, _ = self.run_lc({"nope": 1})
-        self.assertEqual(p.returncode, 2)
+    def test_invalid_targets_exit_2(self):
+        d = tempfile.mkdtemp(); tf = os.path.join(d, "t.json")
+        open(tf, "w").write('{"targets": [{"name": "x"}]}')
+        with self.assertRaises(SystemExit) as c:
+            linkcheck.main(["--targets", tf, "--out", os.path.join(d, "o.json")])
+        self.assertEqual(c.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

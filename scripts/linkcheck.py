@@ -1,305 +1,172 @@
 #!/usr/bin/env python3
-# Draft by openai/gpt-oss-120b (via Groq, ai-job fleet-linkcheck-1023); reviewed, fixed (retry bug, hashing, external links) and tested by Sir Grokkius (AI agent).
-"""
-linkcheck.py – CI smoke‑test for published sites.
+"""linkcheck.py - scheduled CI smoke test of the Sir Grokkius sites (stdlib only).
 
-Usage:
-    python linkcheck.py --targets targets.json --out results/linkcheck.json \
-        [--timeout 20] [--workers 6] [--prev results/linkcheck.json]
-"""
+Fetches each target page, checks status + required terms, then checks every
+absolute http(s) link found on those pages (each unique URL once, capped).
+Writes one compact JSON file. Never stores page bodies.
 
-import argparse
-import concurrent.futures
-import hashlib
-import json
-import os
-import re
-import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
+  python scripts/linkcheck.py --targets targets.json --out results/linkcheck.json \
+      [--prev results/linkcheck.json] [--timeout 20] [--workers 8] [--max-links 300]
+
+Drafted by Groq gpt-oss-120b via ai-job (fleet-linkcheck-1023); reviewed and fixed by
+Sir Grokkius (an AI agent): all links not just same-host, global dedupe, sha for any 2xx,
+deterministic order, HEAD->GET fallback on 403/405/501, tolerant --prev, input validation.
+"""
+import argparse, concurrent.futures as cf, hashlib, json, re, sys, time
+import urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-
-MAX_BYTES = 2 * 1024 * 1024          # 2 MiB
-MAX_LINKS_EXTRACT = 200
-MAX_LINKS_CHECK = 60
-RETRY_DELAY = 3.0                    # seconds
-USER_AGENT = (
-    "grokkius-fleet-linkcheck/1.0 (+https://github.com/SirGrokkius/grokkius-fleet)"
-)
-
-# ---------------------------------------------------------------------------
-
-def load_json(path: Path):
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Failed to read JSON from {path}: {e}", file=sys.stderr)
-        sys.exit(2)
+MAX_BYTES = 2 * 1024 * 1024
+RETRY_DELAY = 3.0
+UA = "grokkius-fleet-linkcheck/1.0 (+https://github.com/SirGrokkius/grokkius-fleet)"
+HREF = re.compile(r'<a\s[^>]*?href\s*=\s*["\']([^"\']+)["\']', re.I)
 
 
-def save_json(data, path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, separators=(",", ":"), ensure_ascii=False)
+def _req(url, method, timeout):
+    r = urllib.request.Request(url, method=method, headers={"User-Agent": UA, "Accept": "*/*"})
+    return urllib.request.urlopen(r, timeout=timeout)
 
 
-def fetch_url(url: str, timeout: int):
-    """Return (code, body_bytes, elapsed_ms) or raise."""
-    headers = {"User-Agent": USER_AGENT}
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    start = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        code = resp.getcode()
-        body = resp.read(MAX_BYTES + 1)  # read a bit more to know if we exceed
-        if len(body) > MAX_BYTES:
-            body = body[:MAX_BYTES]
-        elapsed = (time.perf_counter() - start) * 1000
-        return code, body, elapsed
-    # unreachable
-
-
-def head_or_get(url: str, timeout: int):
-    """Return (code, error_flag). 405 on HEAD falls back to GET."""
-    headers = {"User-Agent": USER_AGENT}
-    # HEAD
-    req = urllib.request.Request(url, headers=headers, method="HEAD")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.getcode(), None
-    except urllib.error.HTTPError as e:
-        if e.code == 405:  # Method Not Allowed – try GET
-            try:
-                req = urllib.request.Request(url, headers=headers, method="GET")
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return resp.getcode(), None
-            except urllib.error.HTTPError as e2:
-                return e2.code, None
-            except Exception as exc:
-                return None, exc
-        return e.code, None
-    except Exception as exc:
-        return None, exc
-
-
-def extract_links(html: str, base_url: str, external: bool = False):
-    """Return up to MAX_LINKS_EXTRACT absolute same‑host URLs (deduped)."""
-    base = urllib.parse.urlparse(base_url)
-    pattern = re.compile(r'<a\s[^>]*href=["\']([^"\']+)["\']', re.IGNORECASE)
-    found = set()
-    for match in pattern.finditer(html):
-        href = match.group(1).strip()
-        if not href:
-            continue
-        abs_url = urllib.parse.urljoin(base_url, href)
-        parsed = urllib.parse.urlparse(abs_url)
-        # drop fragment
-        parsed = parsed._replace(fragment="")
-        abs_url = urllib.parse.urlunparse(parsed)
-        if parsed.scheme not in ("http", "https"):
-            continue
-        if parsed.netloc != base.netloc and not external:
-            continue
-        if abs_url not in found:
-            found.add(abs_url)
-        if len(found) >= MAX_LINKS_EXTRACT:
-            break
-    return list(found)
-
-
-def process_target(target, timeout, workers, external=False):
-    name = target["name"]
-    url = target["url"]
-    terms = target.get("terms", [])
-    result = {
-        "name": name,
-        "url": url,
-        "status": None,
-        "code": None,
-        "ms": None,
-        "bytes": 0,
-        "sha256_16": None,
-        "missing": [],
-        "broken_links": [],
-        "changed": False,
-    }
-
-    # ---- fetch with one retry on network error / 5xx ----
-    attempt = 0
-    code, body, elapsed = None, b"", 0
-    while attempt < 2:
+def fetch(url, timeout):
+    """GET with one retry on network error / 5xx. Returns (code|None, body, ms)."""
+    for attempt in (0, 1):
+        t = time.perf_counter()
         try:
-            code, body, elapsed = fetch_url(url, timeout)
-            break
+            with _req(url, "GET", timeout) as r:
+                body = r.read(MAX_BYTES)
+                return r.getcode(), body, int((time.perf_counter() - t) * 1000)
         except urllib.error.HTTPError as e:
-            # HTTPError provides a code; treat 5xx as retryable
-            if 500 <= e.code <= 599 and attempt == 0:
-                attempt += 1
-                time.sleep(RETRY_DELAY)
-                continue
-            # other HTTP errors are final
-            code, body, elapsed = e.code, b"", 0
-            break
+            if 500 <= e.code < 600 and attempt == 0:
+                time.sleep(RETRY_DELAY); continue
+            return e.code, b"", int((time.perf_counter() - t) * 1000)
         except Exception:
-            attempt += 1
-            if attempt < 2:
-                time.sleep(RETRY_DELAY)
-                continue
-            # after retry give up
-            code, body, elapsed = None, b"", 0
+            if attempt == 0:
+                time.sleep(RETRY_DELAY); continue
+            return None, b"", int((time.perf_counter() - t) * 1000)
+
+
+def probe(url, timeout):
+    """HEAD, falling back to GET when HEAD is refused. Returns code or None."""
+    try:
+        with _req(url, "HEAD", timeout) as r:
+            return r.getcode()
+    except urllib.error.HTTPError as e:
+        if e.code not in (403, 405, 501):
+            return e.code
+    except Exception:
+        pass
+    code, _, _ = fetch(url, timeout)
+    return code
+
+
+def links_in(html, base):
+    out, seen = [], set()
+    for m in HREF.finditer(html):
+        u = urllib.parse.urljoin(base, m.group(1).strip())
+        p = urllib.parse.urlparse(u)
+        if p.scheme not in ("http", "https") or not p.netloc:
+            continue
+        u = urllib.parse.urlunparse(p._replace(fragment=""))
+        if u not in seen:
+            seen.add(u); out.append(u)
+        if len(out) >= 200:
             break
-
-    # Record generic fields
-    result["code"] = code
-    result["ms"] = int(elapsed) if elapsed is not None else None
-    result["bytes"] = len(body)
-
-    # ---- classify status ----
-    if code is None:
-        result["status"] = "dead"
-        return result
-
-    if 200 <= code <= 299:
-        result["sha256_16"] = hashlib.sha256(body).hexdigest()[:16]
-        # ok – inspect terms
-        text = body.decode("utf-8", errors="ignore")
-        missing = [t for t in terms if t.lower() not in text.lower()]
-        if missing:
-            result["status"] = "missing_terms"
-            result["missing"] = missing
-        else:
-            result["status"] = "ok"
-
-            # ---- extract & check links (limited to MAX_LINKS_CHECK) ----
-            links = sorted(extract_links(text, url, external or target.get("external", False)))[:MAX_LINKS_CHECK]
-            result["links_checked"] = len(links)
-
-            if links:
-                broken = []
-
-                def check_one(link):
-                    c, err = head_or_get(link, timeout)
-                    if err is not None or (c is not None and c >= 500):
-                        time.sleep(RETRY_DELAY)
-                        c, err = head_or_get(link, timeout)
-                    if err is not None or (c is not None and c >= 400):
-                        out = {"url": link, "code": c}
-                        if err is not None:
-                            out["err"] = type(err).__name__
-                        return out
-                    return None
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                    futures = {ex.submit(check_one, l): l for l in links}
-                    for fut in concurrent.futures.as_completed(futures):
-                        br = fut.result()
-                        if br:
-                            broken.append(br)
-
-                result["broken_links"] = sorted(broken, key=lambda b: b["url"])
-    elif code in (401, 403, 429):
-        result["status"] = "blocked"
-    elif code in (404, 410):
-        result["status"] = "dead"
-    else:
-        result["status"] = "error"
-
-    return result
+    return out
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--targets", required=True, type=Path, help="JSON file with targets")
-    p.add_argument("--out", required=True, type=Path, help="Result JSON file")
-    p.add_argument("--timeout", type=int, default=20, help="Request timeout seconds")
-    p.add_argument("--workers", type=int, default=6, help="Thread pool size")
-    p.add_argument("--prev", type=Path, help="Previous results for change detection")
-    p.add_argument("--external", action="store_true", help="also check off-site links")
-    args = p.parse_args()
+def classify(code, missing):
+    if code is None or code in (404, 410):
+        return "dead"
+    if 200 <= code < 300:
+        return "missing_terms" if missing else "ok"
+    if code in (401, 403, 429):
+        return "blocked"
+    return "error"
 
-    # load targets
-    data = load_json(args.targets)
-    if not isinstance(data, dict) or "targets" not in data:
-        print("Invalid targets file: missing 'targets' key", file=sys.stderr)
-        sys.exit(2)
-    targets = data["targets"]
-    if not isinstance(targets, list):
-        print("Invalid targets file: 'targets' must be a list", file=sys.stderr)
+
+def load_targets(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        ts = data["targets"]
+        assert isinstance(ts, list) and ts
+        for t in ts:
+            assert isinstance(t.get("name"), str) and t["name"]
+            assert str(t.get("url", "")).startswith(("http://", "https://"))
+            assert isinstance(t.get("terms", []), list)
+        return ts
+    except Exception as e:
+        print(f"invalid targets file {path}: {e.__class__.__name__} {e}", file=sys.stderr)
         sys.exit(2)
 
-    # load previous results if any
-    prev_map = {}
-    if args.prev and args.prev.is_file():
-        try:
-            prev = json.loads(args.prev.read_text(encoding="utf-8"))
-        except Exception:
-            prev = {}
-        for entry in prev.get("results", []):
-            prev_map[entry["name"]] = entry.get("sha256_16")
 
-    results = []
-    summary = {
-        "total": 0,
-        "ok": 0,
-        "missing_terms": 0,
-        "blocked": 0,
-        "dead": 0,
-        "error": 0,
-        "broken_links": 0,
-        "changed": 0,
-    }
+def load_prev(path):
+    try:
+        return {r["name"]: r.get("sha256_16") for r in json.loads(Path(path).read_text())["results"]}
+    except Exception:
+        return {}
 
-    # process targets concurrently
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {
-            executor.submit(process_target, tgt, args.timeout, max(2, args.workers // 2), args.external): tgt
-            for tgt in targets
-        }
-        for fut in concurrent.futures.as_completed(futures):
-            res = fut.result()
-            # change detection
-            prev_hash = prev_map.get(res["name"])
-            if res["sha256_16"] and prev_hash and res["sha256_16"] != prev_hash:
-                res["changed"] = True
-                summary["changed"] += 1
-            else:
-                res["changed"] = False
 
-            # update summary counters
-            summary["total"] += 1
-            status = res["status"]
-            if status in summary:
-                summary[status] += 1
-            if status == "ok":
-                broken = len(res.get("broken_links", []))
-                summary["broken_links"] += broken
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--targets", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--prev")
+    ap.add_argument("--timeout", type=int, default=20)
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--max-links", type=int, default=300)
+    a = ap.parse_args(argv)
+    targets = load_targets(a.targets)
+    prev = load_prev(a.prev) if a.prev else {}
+    t0 = time.time()
 
-            results.append(res)
+    def do_target(t):
+        code, body, ms = fetch(t["url"], a.timeout)
+        text = body.decode("utf-8", "ignore") if body else ""
+        low = text.lower()
+        missing = [x for x in t.get("terms", []) if x.lower() not in low] if code and 200 <= code < 300 else []
+        sha = hashlib.sha256(body).hexdigest()[:16] if code and 200 <= code < 300 else None
+        return {"name": t["name"], "url": t["url"], "status": classify(code, missing), "code": code, "ms": ms,
+                "bytes": len(body), "sha256_16": sha, "missing": missing,
+                "changed": bool(sha and prev.get(t["name"]) and prev[t["name"]] != sha),
+                "_links": links_in(text, t["url"]) if text else []}
 
-    # sort results
-    results.sort(key=lambda x: x["name"])
+    with cf.ThreadPoolExecutor(a.workers) as ex:
+        results = sorted(ex.map(do_target, targets), key=lambda r: r["name"])
 
-    out_obj = {
-        "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        "summary": summary,
-        "results": results,
-    }
-
-    save_json(out_obj, args.out)
-
-    # one‑line summary to stdout
-    print(
-        f"Generated {summary['total']} results: ok={summary['ok']} "
-        f"missing_terms={summary['missing_terms']} blocked={summary['blocked']} "
-        f"dead={summary['dead']} error={summary['error']} broken_links={summary['broken_links']} "
-        f"changed={summary['changed']}"
-    )
+    # global link check: each unique URL once (target pages reuse their fetch result)
+    page_codes = {r["url"]: r["code"] for r in results}  # reuse codes of fetched target pages
+    page_urls = set(page_codes)
+    uniq = []
+    for r in results:
+        for u in r["_links"]:
+            if u not in page_urls and u not in uniq:
+                uniq.append(u)
+    skipped = max(0, len(uniq) - a.max_links)
+    uniq = uniq[: a.max_links]
+    with cf.ThreadPoolExecutor(a.workers) as ex:
+        codes = dict(zip(uniq, ex.map(lambda u: probe(u, a.timeout), uniq)))
+    checked = len(codes)
+    codes.update(page_codes)
+    for r in results:
+        r["broken_links"] = sorted(({"url": u, "code": codes[u]} for u in r.pop("_links")
+                                    if u in codes and (codes[u] is None or codes[u] >= 400)
+                                    and codes[u] not in (401, 403, 429)), key=lambda x: x["url"])
+    blocked_links = sorted(u for u, c in codes.items() if c in (401, 403, 429) and u not in page_urls)
+    s = {k: 0 for k in ("total", "ok", "missing_terms", "blocked", "dead", "error", "broken_links", "changed")}
+    for r in results:
+        s["total"] += 1; s[r["status"]] += 1; s["changed"] += r["changed"]
+    broken = sorted({b["url"]: b for r in results for b in r["broken_links"]}.values(), key=lambda x: x["url"])
+    s["broken_links"] = len(broken)
+    s.update(links_checked=checked, links_skipped=skipped, links_blocked=len(blocked_links),
+             wall_s=round(time.time() - t0, 1))
+    out = {"generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "summary": s,
+           "broken": broken, "blocked_links": blocked_links, "results": results}
+    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(a.out).write_text(json.dumps(out, separators=(",", ":"), ensure_ascii=False))
+    print("linkcheck " + " ".join(f"{k}={v}" for k, v in s.items()))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

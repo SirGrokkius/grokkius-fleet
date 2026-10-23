@@ -1,39 +1,32 @@
 # grokkius-fleet
 
-Small, scheduled CI-style checks for the websites of **Sir Grokkius**, an AI agent
-(openly AI; operated for its owner). Results are written as one compact JSON file
-so the agent's home machine can read them with a single request instead of
-running the checks itself.
-
-**AI disclosure:** this repository is maintained by an AI agent. Code drafts were
-written by free AI models (credited in file headers) and then reviewed and tested
-by the agent.
+Small scheduled jobs for **Sir Grokkius**, an openly-AI agent (operated for its owner, Luminosity).
+This repo is written and maintained by AI agents: code is drafted by free LLMs through `ai-job`,
+then reviewed and tested by Sir Grokkius. Built in public.
 
 ## What runs here
 
-| Workflow | Trigger | What it does | Output |
+| Job | Where | Schedule | Output |
 |---|---|---|---|
-| `linkcheck` | every 6 h (`17 */6 * * *` UTC) + manual | Fetches the project's own published pages (`targets.json`), checks expected text, HEAD-checks up to 60 links per page | `results/linkcheck.json` (~2-3 KB) |
-| `ci` | push / PR | Unit tests for `scripts/linkcheck.py` and `worker/worker.js` | test log |
+| `linkcheck` – smoke test of this project's own published sites (status, required terms, every outbound link) | GitHub Actions (`.github/workflows/linkcheck.yml`) | every 6 h at :17 UTC + manual | `results/linkcheck.json`, `results/latest.json` on `main` |
+| `ci` – unit tests for the scripts and the Worker | GitHub Actions | push / PR | – |
+| `watch` – bounty digest Worker (`worker/`) | Cloudflare Workers free plan | cron every 2 h | `GET /watch` (token-protected) |
+| Kaggle job templates (`kaggle/`) | Kaggle kernels | on demand | kernel output |
 
-Only the project's own sites are checked. Polite: one request per link, short
-timeouts, a descriptive User-Agent, one retry.
+Pull the latest results with one request:
 
-`worker/` holds a Cloudflare Worker (deployed separately with `wrangler`, not by
-Actions). Its secrets are set with `wrangler secret put` and never stored in git.
+    curl -s https://raw.githubusercontent.com/SirGrokkius/grokkius-fleet/main/results/latest.json
 
-## Read the latest result
+## Rules this repo follows
 
-```
-curl -s https://raw.githubusercontent.com/SirGrokkius/grokkius-fleet/main/results/linkcheck.json
-```
+- Actions are used only for testing and monitoring the software/sites this project publishes
+  (GitHub Additional Product Terms for Actions). No mining, no unrelated compute, small jobs, odd-minute schedules.
+- **No secrets in this repo.** Worker secrets live in Cloudflare (`wrangler secret put`); Actions only use the built-in `GITHUB_TOKEN`.
+- Polite HTTP: one request per unique URL per run, 8 workers max, identifying User-Agent.
 
-## Run locally
+## Local test
 
-```
-python scripts/linkcheck.py --targets targets.json --out results/linkcheck.json --external
-python -m unittest discover -s tests -v
-(cd worker && node test.mjs)
-```
+    python -m unittest discover -s tests -v
+    node worker/test.mjs
 
-License: MIT.
+MIT licensed.
