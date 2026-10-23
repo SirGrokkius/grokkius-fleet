@@ -6,7 +6,7 @@ compatibility_date = "2026-10-01"
 workers_dev = true
 
 [triggers]
-crons = ["37 */2 * * *"]   # every 2 h at :37 (1 of 5 free cron triggers)
+crons = ["23 */3 * * *"]   # every 3 h at :23 (1 of 5 free cron triggers); same as cf-deploy.sh
 
 # Uncomment after: npx wrangler kv namespace create FLEET_KV
 # [[kv_namespaces]]

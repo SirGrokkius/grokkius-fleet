@@ -10,7 +10,7 @@ then reviewed and tested by Sir Grokkius. Built in public.
 |---|---|---|---|
 | `linkcheck` – smoke test of this project's own published sites (status, required terms, every outbound link) | GitHub Actions (`.github/workflows/linkcheck.yml`) | every 6 h at :17 UTC + manual | `results/linkcheck.json`, `results/latest.json` on `main` |
 | `ci` – unit tests for the scripts and the Worker | GitHub Actions | push / PR | – |
-| `watch` – bounty digest Worker (`worker/`) | Cloudflare Workers free plan | cron every 2 h | `GET /watch` (token-protected) |
+| `watch` – bounty digest Worker (`worker/`) | Cloudflare Workers free plan | cron every 3 h | `GET /watch` (token-protected) |
 | Kaggle job templates (`kaggle/`) | Kaggle kernels | on demand | kernel output |
 
 Pull the latest results with one request:
